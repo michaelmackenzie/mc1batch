@@ -211,6 +211,33 @@ echo "cannot find $(head -1 "$2") on: {locs}; give --location" >&2; exit 1
     return [to_url(p) for p in lines[2:]]
 
 
+def check_staged(inputs: list[str], what: str, sample: int = 200) -> None:
+    """Refuse inputs that are only on tape: xrootd cannot recall them, so the
+    tasks would fail to open them. Checks up to `sample` files, spread evenly."""
+    step = max(1, len(inputs) // sample)
+    checked, tape = 0, []
+    for url in inputs[::step]:
+        if not url.startswith(f"{XRD_HOST}/mu2e/"):
+            continue
+        path = Path("/pnfs" + url[len(XRD_HOST):])
+        try:
+            loc = (path.parent / f".(get)({path.name})(locality)").read_text().strip()
+        except OSError:
+            continue
+        checked += 1
+        if "ONLINE" not in loc:
+            tape.append(path.name)
+    if tape:
+        frac = f"{len(tape)} of {checked} checked"
+        die(f"{frac} input files are on tape only (NEARLINE), e.g. {tape[0]}.\n"
+            f"Stage them first, then submit again:\n"
+            f"  source {SETUP_ART}; muse setup ops\n"
+            f"  mdh prestage-files {what}      # add -m to only monitor progress\n"
+            f"or pass --skip-stage-check to submit anyway.")
+    if checked:
+        info(f"inputs on disk ({checked} checked)")
+
+
 # ------------------------------------------------------------- submission
 
 def outdir(name: str, jid: str) -> Path:
@@ -368,6 +395,8 @@ def cmd_submit(a) -> None:
         if not inputs:
             die("no input files")
         mode, ntasks = "input", math.ceil(len(inputs) / a.files_per_job)
+        if not a.skip_stage_check:
+            check_staged(inputs, a.dataset if a.dataset and not a.max_files else "<file names>")
 
     m = {
         "name": a.name, "user": USER, "version": VERSION, "mode": mode,
@@ -627,6 +656,8 @@ def main() -> None:
                    help="where --dataset files live (default: probe disk, tape, scratch)")
     s.add_argument("--files-per-job", type=int, default=1)
     s.add_argument("--max-files", type=int, help="use only the first N files (for tests)")
+    s.add_argument("--skip-stage-check", action="store_true",
+                   help="submit even if inputs are on tape only (they would fail to open)")
     s.add_argument("-n", "--nevents", type=int, default=0, help="events per task (0 = all)")
     s.add_argument("--seed", type=int, default=0, help="generator mode: baseSeed = seed + task")
     s.add_argument("--extra", "--args", dest="extra", default="",

@@ -132,6 +132,15 @@ the Slurm state; rerun them with `resubmit --mem/--time`.
   release (`muse setup SimJob <version>`, `muse setup EventNtuple ...`,
   `pyenv ana`); a local muse build cannot be used yet. The fcl's `#include`s
   must resolve in that release.
+- **Inputs must be on disk.** xrootd cannot recall files that are only on
+  tape (dCache `NEARLINE`). `submit` checks up to 200 inputs through the
+  local `/pnfs` mount and refuses if any are tape-only; stage them first with
+  `mdh prestage-files <dataset or file names>` (after `muse setup ops`), which
+  can take hours for a large dataset. `--skip-stage-check` overrides.
+- **Copy-out uses the node's own xrootd client** (`/usr/bin/xrdcp`, clean
+  environment), because the `xrdcp` from an older release set up by `--setup`
+  cannot authenticate with a token. The same may apply to reading inputs
+  with ROOT from an old release; prefer a recent release.
 - **The token.** Jobs have no Kerberos ticket, so your bearer token (from
   `htgettoken`, valid ~3 h) is copied to
   `/scratch/$USER/mc1batch/.token/bt` on every node at each submit, readable

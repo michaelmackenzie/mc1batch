@@ -21,13 +21,19 @@ dest_path="$MC1_XRD_PATH/$MC1_NAME/$MC1_ID"
 token="/scratch/$MC1_USER/mc1batch/.token/bt"
 pending="/data-local/$MC1_USER/mc1batch/$MC1_NAME/$MC1_ID/pending/$tag"
 
+# The node's own xrootd clients in a clean environment: a release set up by
+# --setup can put an older xrdcp on PATH that cannot authenticate with a token.
+xrd() {
+    env -i PATH=/usr/bin:/bin HOME="$HOME" BEARER_TOKEN_FILE="$token" "$@"
+}
+
 # Copy one local file to $dest_path/<rel>, replacing any older copy
 # (dCache does not overwrite in place).
 put() {
     local src=$1 rel=$2 try
-    xrdfs "$MC1_XRD_HOST" rm "$dest_path/$rel" >/dev/null 2>&1
+    xrd xrdfs "$MC1_XRD_HOST" rm "$dest_path/$rel" >/dev/null 2>&1
     for try in 1 2 3; do
-        xrdcp -s -p "$src" "$MC1_XRD_HOST/$dest_path/$rel" && return 0
+        xrd xrdcp -s -p "$src" "$MC1_XRD_HOST/$dest_path/$rel" && return 0
         echo "mc1batch: xrdcp of $rel failed (try $try)"
         sleep 30
     done
