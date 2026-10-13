@@ -1,0 +1,672 @@
+#!/usr/bin/env python3
+"""mc1batch: run Mu2e jobs on the MC-1 Slurm cluster from an interactive node.
+
+Jobs read their inputs over xrootd, run under the shared mu2ebatch account and
+copy their outputs to /pnfs/mu2e/scratch/users/$USER/slurm/<name>/<id>/.
+See README.md for the full description.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import io
+import json
+import math
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tarfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+
+VERSION = "0.1.0"
+PKG = Path(__file__).resolve().parent.parent
+JOB_SH = PKG / "mc1batch" / "job.sh"
+
+USER = os.environ.get("MC1_USER", os.environ.get("USER", ""))
+GATEWAY = os.environ.get("MC1_GATEWAY", "mu2eshift@g2gateway01.fnal.gov")
+EXTRA_JUMP = os.environ.get("MC1_EXTRA_JUMP", "")  # e.g. mu2eshift@mu2egateway02.fnal.gov
+ACCOUNT = os.environ.get("MC1_ACCOUNT", "mu2ebatch")
+SUBMIT_HOST = os.environ.get("MC1_SUBMIT_HOST", "mu2e-mc1-worker-01.fnal.gov")
+PARTITION = os.environ.get("MC1_PARTITION", "mc1")
+OUTBASE = Path(os.environ.get("MC1_OUTBASE", f"/pnfs/mu2e/scratch/users/{USER}/slurm"))
+XRD_HOST = "root://fndcadoor.fnal.gov:1094"
+VAULT = "htvaultprod.fnal.gov"
+MAX_ARRAY = 1000           # MaxArraySize is 1001, so indices 0..1000
+MAX_SCRIPT = 3_500_000     # Slurm's default script limit is 4 MB
+SETUP_ART = "/cvmfs/mu2e.opensciencegrid.org/setupmu2e-art.sh"
+
+# Names the task script uses in its work directory.
+RESERVED = {"job.sh", "job.fcl", "user.sh", "inputs.txt", "task_inputs.txt", "task.log",
+            "status.txt", "outputs.txt", "out", "rc", "env.sh", ".mc1_start"}
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+STATE_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/mc1batch-{os.getuid()}") / "mc1batch"
+
+
+def die(msg: str) -> None:
+    sys.exit(f"mc1batch: {msg}")
+
+
+def info(msg: str) -> None:
+    print(msg, flush=True)
+
+
+# --------------------------------------------------------------------- ssh
+
+def ssh_config() -> Path:
+    """Write an ssh config that multiplexes all connections over one gateway login."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (STATE_DIR / "cm").mkdir(exist_ok=True, mode=0o700)
+    gw_user, gw_host = GATEWAY.split("@", 1)
+    lines = [
+        "Host *",
+        "  GSSAPIAuthentication yes",
+        "  BatchMode yes",
+        "  ConnectTimeout 20",
+        "  ServerAliveInterval 30",
+        "  StrictHostKeyChecking accept-new",
+        "  ControlMaster auto",
+        f"  ControlPath {STATE_DIR}/cm/%C",
+        "  ControlPersist 10m",
+        "  LogLevel ERROR",
+    ]
+    if EXTRA_JUMP:
+        u, h = EXTRA_JUMP.split("@", 1)
+        lines += ["Host mc1-extra-jump", f"  HostName {h}", f"  User {u}"]
+    lines += ["Host mc1-gateway", f"  HostName {gw_host}", f"  User {gw_user}"]
+    if EXTRA_JUMP:
+        lines.append("  ProxyJump mc1-extra-jump")
+    lines += ["Host mu2e-mc1-worker-*", f"  User {ACCOUNT}", "  ProxyJump mc1-gateway"]
+    path = STATE_DIR / "ssh_config"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+_SSH_CFG: Path | None = None
+
+
+def ssh(host: str, cmd: str, stdin: bytes | None = None, check: bool = True,
+        timeout: int = 300) -> subprocess.CompletedProcess:
+    global _SSH_CFG
+    if _SSH_CFG is None:
+        _SSH_CFG = ssh_config()
+    p = subprocess.run(["ssh", "-F", str(_SSH_CFG), host, cmd], input=stdin,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    # mu2ebatch's login scripts print a "Kerberos Fail" banner; drop it.
+    err = "\n".join(l for l in p.stderr.decode(errors="replace").splitlines()
+                    if not re.search(r"Configuring (Git|Kerberos)|Kerberos (Ticket|Fail)", l))
+    p.stderr = err
+    p.stdout = p.stdout.decode(errors="replace")
+    if check and p.returncode != 0:
+        die(f"ssh {host} '{cmd[:80]}' failed ({p.returncode}): {err.strip()}")
+    return p
+
+
+def submit_host(cmd: str, **kw) -> subprocess.CompletedProcess:
+    return ssh(SUBMIT_HOST, cmd, **kw)
+
+
+def nodes() -> list[str]:
+    """Compute nodes of the partition that are not down or drained."""
+    out = submit_host(f"sinfo -h -N -p {PARTITION} -o '%N %t'").stdout
+    good = []
+    for line in out.splitlines():
+        n, state = line.split()
+        if not re.search(r"down|drain|fail|maint|unk", state) and n not in good:
+            good.append(n)
+    if not good:
+        die(f"no usable nodes in partition {PARTITION}")
+    return good
+
+
+def on_nodes(names: list[str], cmd: str, stdin: bytes | None = None) -> dict[str, subprocess.CompletedProcess]:
+    """Run cmd on every node directly (not through Slurm, so it works when the cluster is full)."""
+    def one(n):
+        try:
+            return n, ssh(f"{n}.fnal.gov", cmd, stdin=stdin, check=False, timeout=120)
+        except subprocess.TimeoutExpired:
+            return n, subprocess.CompletedProcess([], 124, "", "timeout")
+    # Open the gateway master first so the parallel logins share it.
+    submit_host("true")
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        return dict(ex.map(one, names))
+
+
+# ------------------------------------------------------------------- token
+
+def token_file() -> Path:
+    return Path(os.environ.get("BEARER_TOKEN_FILE") or f"/run/user/{os.getuid()}/bt_u{os.getuid()}")
+
+
+def token_minutes_left(path: Path) -> float:
+    try:
+        payload = path.read_text().strip().split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return (json.loads(base64.urlsafe_b64decode(payload))["exp"] - time.time()) / 60
+    except (OSError, IndexError, KeyError, ValueError):
+        return -1
+
+
+def fresh_token(min_minutes: int = 90) -> Path:
+    path = token_file()
+    if token_minutes_left(path) < min_minutes:
+        info("getting a fresh bearer token")
+        r = subprocess.run(["htgettoken", "-a", VAULT, "-i", "mu2e", f"--minsecs={min_minutes * 60}"],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if r.returncode != 0 or token_minutes_left(path) <= 0:
+            die("htgettoken failed (is your Kerberos ticket valid?):\n" + r.stdout.decode(errors="replace"))
+    return path
+
+
+def push_token(names: list[str]) -> list[str]:
+    """Install the token and per-user directories on every node; return the nodes that failed."""
+    tok = fresh_token()
+    d = f"/scratch/{USER}/mc1batch/.token"
+    cmd = (f"umask 077 && mkdir -p {d} /data-local/{USER}/mc1batch/slurm && chmod 700 {d} "
+           f"&& cat > {d}/bt.new && mv -f {d}/bt.new {d}/bt")
+    res = on_nodes(names, cmd, stdin=tok.read_bytes())
+    bad = [n for n, r in res.items() if r.returncode != 0]
+    left = token_minutes_left(tok)
+    info(f"token ({left:.0f} min left) installed on {len(names) - len(bad)}/{len(names)} nodes"
+         + (f"; failed: {' '.join(bad)}" if bad else ""))
+    return bad
+
+
+# ------------------------------------------------------------------ inputs
+
+def to_url(entry: str) -> str:
+    entry = entry.strip()
+    if entry.startswith("root://"):
+        return entry
+    if entry.startswith("/pnfs/mu2e/"):
+        return f"{XRD_HOST}/{entry[len('/pnfs/'):]}"
+    die(f"cannot turn '{entry}' into an xrootd URL; give /pnfs paths, root:// URLs or use --dataset")
+
+
+def dataset_urls(dataset: str, location: str, max_files: int | None) -> list[str]:
+    """Dataset -> xrootd URLs. File names come from SAM and paths from mdh's naming
+    convention, so no metacat login is needed. One shell, so the setup runs once."""
+    locs = "disk tape scratch" if location == "auto" else location
+    script = f"""
+source {SETUP_ART} >/dev/null 2>&1; muse setup ops >/dev/null 2>&1
+samweb list-definition-files "$1" | sort | head -n {max_files or 10**9} > "$2"
+[ -s "$2" ] || {{ echo "SAM lists no files for $1" >&2; exit 1; }}
+for loc in {locs}; do
+  p=$(mdh print-url -s path -l $loc $(head -1 "$2")) || exit 1
+  if [ -e "$p" ] || [ {len(locs.split())} -eq 1 ]; then echo "LOCATION $loc"; mdh print-url -s path -l $loc - < "$2"; exit; fi
+done
+echo "cannot find $(head -1 "$2") on: {locs}; give --location" >&2; exit 1
+"""
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    r = subprocess.run(["bash", "-c", script, "_", dataset, str(STATE_DIR / "names.txt")],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    lines = r.stdout.split()
+    if r.returncode != 0 or not lines or lines[0] != "LOCATION":
+        die(f"cannot resolve {dataset}: {r.stderr.strip()}")
+    info(f"{dataset}: {len(lines) - 2} files on {lines[1]}")
+    return [to_url(p) for p in lines[2:]]
+
+
+# ------------------------------------------------------------- submission
+
+def outdir(name: str, jid: str) -> Path:
+    return OUTBASE / name / str(jid)
+
+
+def xrd_path(p: Path) -> str:
+    s = str(p)
+    if not s.startswith("/pnfs/mu2e/"):
+        die(f"output base {p} must be under /pnfs/mu2e/")
+    return s[len("/pnfs"):]
+
+
+def read_manifest(name: str, jid: str) -> dict:
+    p = outdir(name, jid) / "manifest.json"
+    if not p.exists():
+        die(f"no submission {name}/{jid} (missing {p})")
+    return json.loads(p.read_text())
+
+
+def write_manifest(m: dict) -> None:
+    d = outdir(m["name"], m["id"])
+    d.mkdir(parents=True, exist_ok=True)
+    # dCache files cannot be rewritten in place: write, then swap.
+    tmp = d / "manifest.json.new"
+    tmp.write_text(json.dumps(m, indent=1) + "\n")
+    (d / "manifest.json").unlink(missing_ok=True)
+    tmp.rename(d / "manifest.json")
+
+
+def ranges(nums: list[int]) -> str:
+    nums = sorted(set(nums))
+    out, start = [], None
+    for i, n in enumerate(nums):
+        if start is None:
+            start = n
+        if i + 1 == len(nums) or nums[i + 1] != n + 1:
+            out.append(str(start) if start == n else f"{start}-{n}")
+            start = None
+    return ",".join(out)
+
+
+def batch_script(m: dict, offset: int, idx: list[int], outid: str | None) -> str:
+    """The sbatch script for array indices idx (task = offset + index)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        def add(arcname, data, mode=0o644):
+            ti = tarfile.TarInfo(arcname)
+            ti.size, ti.mode, ti.mtime = len(data), mode, int(time.time())
+            tar.addfile(ti, io.BytesIO(data))
+        add("job.sh", JOB_SH.read_bytes(), 0o755)
+        for fname, data in m["_job_files"].items():
+            add(fname, data, 0o755 if fname == "user.sh" else 0o644)
+        if m["mode"] == "input":
+            lo, hi = offset * m["files_per_job"], (offset + MAX_ARRAY + 1) * m["files_per_job"]
+            add("inputs.txt", ("\n".join(m["_inputs"][lo:hi]) + "\n").encode())
+    payload = base64.encodebytes(buf.getvalue()).decode()
+
+    r = m["resources"]
+    array = ranges(idx) + (f"%{r['max_running']}" if r.get("max_running") else "")
+    env = {
+        "MC1_USER": USER, "MC1_NAME": m["name"], "MC1_OUTID": outid or "",
+        "MC1_TASK_OFFSET": str(offset), "MC1_MODE": m["mode"], "MC1_EXE": m["exe"], "MC1_FPJ": str(m["files_per_job"]),
+        "MC1_NEVENTS": str(m["nevents"]), "MC1_SEED": str(m["seed"]), "MC1_SETUP": m["setup"],
+        "MC1_EXTRA": m["extra"], "MC1_XRD_HOST": XRD_HOST, "MC1_XRD_PATH": xrd_path(OUTBASE),
+    }
+    lines = [
+        "#!/bin/bash",
+        f"#SBATCH --job-name=mc1b-{USER}-{m['name']}",
+        f"#SBATCH --partition={PARTITION}",
+        f"#SBATCH --array={array}",
+        f"#SBATCH --cpus-per-task={r['cpus']}",
+        f"#SBATCH --mem={r['mem']}",
+        f"#SBATCH --time={r['time']}",
+        "#SBATCH --chdir=/tmp",
+        f"#SBATCH --output=/data-local/{USER}/mc1batch/slurm/%x-%A_%a.out",
+        f"#SBATCH --comment=mc1batch:{USER}:{m['name']}",
+    ]
+    if m.get("_exclude"):
+        lines.append(f"#SBATCH --exclude={','.join(m['_exclude'])}")
+    lines += [f"export {k}={shlex.quote(v)}" for k, v in env.items()]
+    lines += [
+        'export MC1_ID=${MC1_OUTID:-$SLURM_ARRAY_JOB_ID}',
+        'export MC1_TASK=$(( SLURM_ARRAY_TASK_ID + MC1_TASK_OFFSET ))',
+        'export MC1_WORK=/scratch/$MC1_USER/mc1batch/$MC1_NAME/$MC1_ID/$(printf %06d $MC1_TASK)',
+        'rm -rf "$MC1_WORK" && mkdir -p "$MC1_WORK" || exit 1',
+        "base64 -d <<'__MC1_PAYLOAD__' | tar -xz -C \"$MC1_WORK\" || exit 1",
+        payload.rstrip("\n"),
+        "__MC1_PAYLOAD__",
+        'exec bash "$MC1_WORK/job.sh"',
+    ]
+    script = "\n".join(lines) + "\n"
+    if len(script) > MAX_SCRIPT:
+        die("batch script too large; ship fewer/smaller files or use more --files-per-job")
+    return script
+
+
+def sbatch(script: str) -> str:
+    out = submit_host("sbatch --parsable", stdin=script.encode()).stdout.strip()
+    jid = out.split(";")[0]
+    if not jid.isdigit():
+        die(f"unexpected sbatch output: {out}")
+    return jid
+
+
+def submit_tasks(m: dict, tasks: list[int], outid: str | None) -> None:
+    """Submit tasks as one array per block of MAX_ARRAY+1 task numbers; record them in m."""
+    for offset in sorted({t // (MAX_ARRAY + 1) * (MAX_ARRAY + 1) for t in tasks}):
+        idx = [t - offset for t in tasks if offset <= t <= offset + MAX_ARRAY]
+        jid = sbatch(batch_script(m, offset, idx, outid))
+        outid = outid or jid
+        m.setdefault("id", jid)
+        m.setdefault("arrays", []).append(jid)
+        m.setdefault("offsets", {})[jid] = offset
+        info(f"submitted array {jid}: {len(idx)} tasks ({offset + min(idx)}..{offset + max(idx)})")
+
+
+def load_inputs(m: dict) -> None:
+    """Attach the job files and input list (kept next to the manifest) for resubmission."""
+    d = outdir(m["name"], m["id"])
+    m["_job_files"] = {f: (d / "job" / f).read_bytes() for f in m["job_files"]}
+    if m["mode"] == "input":
+        m["_inputs"] = (d / "inputs.txt").read_text().split()
+
+
+def cmd_submit(a) -> None:
+    if not NAME_RE.match(a.name):
+        die("name may only contain letters, digits, '_', '.', '-'")
+    exe, main = ("mu2e", Path(a.fcl)) if a.fcl else ("script", Path(a.script))
+    if not main.is_file():
+        die(f"no such file {main}")
+    if exe == "mu2e" and not a.setup:
+        die("--setup is required with -c/--fcl (e.g. 'muse setup SimJob MDC2025ay')")
+    job_files = {"job.fcl" if exe == "mu2e" else "user.sh": main.read_bytes()}
+    for f in a.ship:
+        f = Path(f)
+        if not f.is_file():
+            die(f"no such file to ship: {f}")
+        if f.name in job_files or f.name in RESERVED:
+            die(f"cannot ship {f.name}: name already used")
+        job_files[f.name] = f.read_bytes()
+    if bool(a.dataset) + bool(a.files) + bool(a.njobs) != 1:
+        die("give exactly one of --dataset, --files or --njobs")
+
+    if a.njobs:
+        mode, inputs, ntasks = "gen", [], a.njobs
+    else:
+        if a.dataset:
+            inputs = dataset_urls(a.dataset, a.location, a.max_files)
+        else:
+            inputs = [to_url(l) for l in Path(a.files).read_text().splitlines()
+                      if l.strip() and not l.lstrip().startswith("#")]
+        if a.max_files:
+            inputs = inputs[:a.max_files]
+        if not inputs:
+            die("no input files")
+        mode, ntasks = "input", math.ceil(len(inputs) / a.files_per_job)
+
+    m = {
+        "name": a.name, "user": USER, "version": VERSION, "mode": mode,
+        "submitted": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "command": " ".join(shlex.quote(x) for x in sys.argv),
+        "exe": exe, "source": str(main.resolve()), "job_files": list(job_files),
+        "setup": a.setup, "extra": a.extra,
+        "nevents": a.nevents, "seed": a.seed, "files_per_job": a.files_per_job,
+        "dataset": a.dataset, "ntasks": ntasks, "ninputs": len(inputs),
+        "resources": {"cpus": a.cpus, "mem": a.mem, "time": a.time, "max_running": a.max_running},
+        "_job_files": job_files, "_inputs": inputs,
+    }
+    info(f"{a.name}: {ntasks} tasks running {exe} ({mode}"
+         + (f", {len(inputs)} files, {a.files_per_job}/task" if inputs else "") + ")")
+    if a.dry_run:
+        print(batch_script(m, 0, list(range(min(ntasks, MAX_ARRAY + 1))), None)
+              .split("base64 -d")[0] + "...payload...")
+        return
+
+    m["_exclude"] = push_token(nodes())
+    submit_tasks(m, list(range(ntasks)), None)
+    d = outdir(a.name, m["id"])
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "job").mkdir(exist_ok=True)
+    for fname, data in job_files.items():
+        (d / "job" / fname).write_bytes(data)
+    if inputs:
+        (d / "inputs.txt").write_text("\n".join(inputs) + "\n")
+    write_manifest({k: v for k, v in m.items() if not k.startswith("_")})
+    info(f"outputs -> {d}\nfollow with: mc1batch status {a.name}/{m['id']}")
+    tmax = sum(int(x) * f for x, f in zip(reversed(re.split("[:-]", a.time)), (1, 60, 3600, 86400))) / 60
+    if tmax > token_minutes_left(token_file()):
+        info("note: tasks may outlive the token; keep 'mc1batch token --watch' running "
+             "(e.g. in tmux) until they finish")
+
+
+# ------------------------------------------------------------------ status
+
+def split_ref(ref: str) -> tuple[str, str]:
+    if "/" in ref:
+        name, jid = ref.split("/", 1)
+        return name, jid
+    ids = sorted((p.name for p in (OUTBASE / ref).glob("*") if p.name.isdigit()), key=int)
+    if not ids:
+        die(f"no submissions named {ref} under {OUTBASE}")
+    return ref, ids[-1]
+
+
+def task_status(m: dict) -> dict[int, dict]:
+    """Final status of each completed task, from the status files on pnfs."""
+    out = {}
+    for f in (outdir(m["name"], m["id"]) / "status").glob("*"):
+        if f.name.isdigit():
+            kv = dict(l.split("=", 1) for l in f.read_text().splitlines() if "=" in l)
+            out[int(f.name)] = kv
+    return out
+
+
+ACTIVE = ("PENDING", "RUNNING", "REQUEUED", "RESIZING", "SUSPENDED", "CONFIGURING", "COMPLETING")
+
+
+def classify(m: dict) -> dict[int, tuple[str, str]]:
+    """(category, detail) for every task, from its latest Slurm attempt and its status file.
+
+    A status file only counts if it was written by the latest attempt, so a rerun
+    that failed to copy out is not hidden by an older success."""
+    st = task_status(m)
+    out = submit_host(f"sacct -X -P -n -j {','.join(m['arrays'])} -o JobID,JobIDRaw,State,ExitCode,NodeList",
+                      check=False).stdout
+    order = {j: k for k, j in enumerate(m["arrays"])}
+    offsets = m.get("offsets", {})
+    latest = {}
+    for line in out.splitlines():
+        f = line.split("|")
+        if len(f) < 5 or "_" not in f[0]:
+            continue
+        jid, idx = f[0].split("_", 1)
+        if jid not in order:
+            continue
+        rng = []                       # "5", or an unstarted block such as "[3-9,12%4]"
+        for part in idx.strip("[]").split("%")[0].split(","):
+            lo, _, hi = part.partition("-")
+            rng += range(int(lo), int(hi or lo) + 1)
+        for k in rng:
+            t = k + int(offsets.get(jid, 0))
+            if t not in latest or order[jid] >= order[latest[t][0]]:
+                latest[t] = (jid, f[1], f[2].split()[0], f[3], f[4])
+    res = {}
+    for t in range(m["ntasks"]):
+        s, att = st.get(t), latest.get(t)
+        if att and att[2] in ACTIVE:
+            res[t] = ("running" if att[2] == "RUNNING" else "pending", att[4])
+        elif s and (not att or s.get("slurm_job") == att[1]):
+            exe_rc = f", exit code {s['exe_rc']}" if s.get("exe_rc") and s.get("rc") == "2" else ""
+            res[t] = ("ok", "") if s.get("rc") == "0" else ("failed", f"rc={s.get('rc')} on {s.get('node')}{exe_rc}")
+        elif att and att[3].startswith("3:"):
+            res[t] = ("stranded", f"outputs kept on {att[4]}")
+        elif att:
+            res[t] = ("failed", f"{att[2]} exit {att[3]} on {att[4]} (no status file)")
+        else:
+            res[t] = ("unknown", "no Slurm record or status file")
+    return res
+
+
+def cmd_status(a) -> None:
+    name, jid = split_ref(a.ref)
+    m = read_manifest(name, jid)
+    cls = classify(m)
+    by = {}
+    for t, (c, _) in cls.items():
+        by.setdefault(c, []).append(t)
+    info(f"{name}/{jid}: {m['ntasks']} tasks, arrays {' '.join(m['arrays'])}")
+    for c in ("ok", "running", "pending", "failed", "stranded", "unknown"):
+        info(f"  {c:9s} {len(by.get(c, [])):6d}")
+    rcs = {"1": "setup failed", "2": f"{m.get('exe', 'mu2e')} failed", "3": "copy-out failed",
+           "4": "no token", "5": "no inputs"}
+    for t in (by.get("failed", []) + by.get("stranded", []))[:20]:
+        c, d = cls[t]
+        rc = re.search(r"rc=(\d+)", d)
+        info(f"  task {t:6d} {c}: {d}" + (f" [{rcs.get(rc.group(1), '?')}]" if rc else "")
+             + (f"  log: {outdir(name, jid)}/logs/{t:06d}.log" if c == "failed" and rc else ""))
+    if by.get("stranded"):
+        info(f"copy outputs back with: mc1batch recover {name}/{jid}")
+    if by.get("failed") or by.get("unknown"):
+        info(f"rerun with: mc1batch resubmit {name}/{jid}")
+    if len(by.get("ok", [])) == m["ntasks"]:
+        n = sum(len(s.get("outputs", "").split()) for s in task_status(m).values())
+        info(f"all done: {n} output files in {outdir(name, jid)}")
+
+
+def cmd_resubmit(a) -> None:
+    name, jid = split_ref(a.ref)
+    m = read_manifest(name, jid)
+    if a.tasks:
+        tasks = [int(x) for part in a.tasks.split(",") for x in
+                 (range(int(part.split("-")[0]), int(part.split("-")[1]) + 1) if "-" in part else [part])]
+    else:
+        cls = classify(m)
+        tasks = [t for t, (c, _) in cls.items() if c in ("failed", "unknown")
+                 or (c == "stranded" and a.include_stranded)]
+        if any(c == "stranded" for c, _ in cls.values()) and not a.include_stranded:
+            info("skipping stranded tasks: run 'mc1batch recover' first, or pass --include-stranded")
+    if not tasks:
+        info("nothing to resubmit")
+        return
+    load_inputs(m)
+    if a.time:
+        m["resources"]["time"] = a.time
+    if a.mem:
+        m["resources"]["mem"] = a.mem
+    m["_exclude"] = push_token(nodes())
+    submit_tasks(m, tasks, jid)
+    write_manifest({k: v for k, v in m.items() if not k.startswith("_")})
+
+
+def cmd_recover(a) -> None:
+    name, jid = split_ref(a.ref)
+    ns = nodes()
+    push_token(ns)
+    base = f"/data-local/{USER}/mc1batch/{name}/{jid}/pending"
+    cmd = (f"[ -d {base} ] || exit 0; for d in {base}/*/; do ( cd $d && set -a && source env.sh "
+           f"&& set +a && MC1_WORK=$PWD MC1_COPYOUT_ONLY=1 bash job.sh ); done")
+    n = 0
+    for node, r in on_nodes(ns, cmd).items():
+        for line in r.stdout.split("\n"):
+            if line.strip():
+                n += 1
+                info(f"{node}: {line}")
+    info(f"{n} stranded tasks handled" if n else "nothing stranded on the nodes")
+
+
+def cmd_clean(a) -> None:
+    name, jid = split_ref(a.ref)
+    m = read_manifest(name, jid)
+    if any(c in ("running", "pending") for c, _ in classify(m).values()):
+        die(f"{name}/{jid} still has tasks in Slurm")
+    loc = f"/data-local/{USER}/mc1batch/{name}/{jid}"
+    logs = " ".join(f"/data-local/{USER}/mc1batch/slurm/mc1b-{USER}-{name}-{j}_*.out" for j in m["arrays"])
+    cmd = f"rm -rf /scratch/{USER}/mc1batch/{name}/{jid} {logs}; "
+    if a.force:
+        cmd += f"rm -rf {loc}"
+    else:
+        cmd += f"if [ -n \"$(ls -A {loc}/pending 2>/dev/null)\" ]; then echo pending; else rm -rf {loc}; fi"
+    cmd += f"; rmdir /scratch/{USER}/mc1batch/{name} /data-local/{USER}/mc1batch/{name} 2>/dev/null; true"
+    for node, r in on_nodes(nodes(), cmd).items():
+        if "pending" in r.stdout:
+            info(f"{node}: kept stranded outputs (run 'mc1batch recover', or clean --force)")
+    info(f"cleaned node-local files of {name}/{jid}; outputs on pnfs are untouched")
+
+
+def cmd_list(a) -> None:
+    rows = []
+    for mf in sorted(OUTBASE.glob("*/*/manifest.json")):
+        m = json.loads(mf.read_text())
+        st = task_status(m)
+        ok = sum(1 for s in st.values() if s.get("rc") == "0")
+        rows.append(f"{m['name'] + '/' + m['id']:40s} {m['submitted'][:16]}  {ok:5d}/{m['ntasks']:<5d} ok")
+    info("\n".join(rows) if rows else f"no submissions under {OUTBASE}")
+
+
+def cmd_token(a) -> None:
+    if a.remove:
+        on_nodes(nodes(), f"rm -rf /scratch/{USER}/mc1batch/.token")
+        info("token removed from all nodes")
+        return
+    while True:
+        push_token(nodes())
+        if not a.watch:
+            return
+        out = submit_host("squeue -h -o '%i %j'", check=False).stdout
+        mine = [l for l in out.splitlines() if f" mc1b-{USER}-" in l]
+        if not mine:
+            info("no mc1batch jobs left; stopping")
+            return
+        info(f"{len(mine)} jobs active; next refresh in {a.interval} min")
+        time.sleep(a.interval * 60)
+
+
+def cmd_check(a) -> None:
+    info(f"gateway {GATEWAY}" + (f" via {EXTRA_JUMP}" if EXTRA_JUMP else "") + f", account {ACCOUNT}")
+    info(submit_host(f"hostname -s; whoami; sinfo -p {PARTITION}").stdout.rstrip())
+    ns = nodes()
+    res = on_nodes(ns, "true")
+    bad = [n for n, r in res.items() if r.returncode]
+    info(f"direct ssh to nodes: {len(ns) - len(bad)}/{len(ns)} ok" + (f", failed {' '.join(bad)}" if bad else ""))
+    left = token_minutes_left(token_file())
+    info(f"local token {token_file()}: " + (f"{left:.0f} min left" if left > 0 else "missing or expired"))
+    try:
+        OUTBASE.mkdir(parents=True, exist_ok=True)
+        info(f"output base {OUTBASE}: writable")
+    except OSError as e:
+        info(f"output base {OUTBASE}: NOT writable ({e})")
+
+
+def main() -> None:
+    if not USER:
+        die("USER is not set")
+    p = argparse.ArgumentParser(prog="mc1batch", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=VERSION)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("submit", help="submit a job array")
+    s.add_argument("name", help="submission name (outputs go to <outbase>/<name>/<id>)")
+    e = s.add_mutually_exclusive_group(required=True)
+    e.add_argument("-c", "--fcl", help="run mu2e with this fcl (its #includes must resolve in the release)")
+    e.add_argument("--script", help="run this bash script instead of mu2e (see README for its environment)")
+    s.add_argument("--setup", default="", help="setup command run after setupmu2e-art.sh, e.g. "
+                   "'muse setup SimJob MDC2025ay' (required with --fcl, optional with --script)")
+    s.add_argument("--ship", action="append", default=[], metavar="FILE",
+                   help="extra small file to put in the task's work directory (repeatable)")
+    g = s.add_argument_group("inputs (one of)")
+    g.add_argument("--dataset", help="dataset name, resolved with mdh print-url")
+    g.add_argument("--files", help="text file of /pnfs paths or root:// URLs")
+    g.add_argument("--njobs", type=int, help="generator mode: number of tasks with no input files")
+    s.add_argument("--location", default="auto", choices=["auto", "disk", "tape", "scratch"],
+                   help="where --dataset files live (default: probe disk, tape, scratch)")
+    s.add_argument("--files-per-job", type=int, default=1)
+    s.add_argument("--max-files", type=int, help="use only the first N files (for tests)")
+    s.add_argument("-n", "--nevents", type=int, default=0, help="events per task (0 = all)")
+    s.add_argument("--seed", type=int, default=0, help="generator mode: baseSeed = seed + task")
+    s.add_argument("--extra", "--args", dest="extra", default="",
+                   help="extra arguments for mu2e (e.g. '-T nts.root') or for the script")
+    s.add_argument("--cpus", type=int, default=1)
+    s.add_argument("--mem", default="4G")
+    s.add_argument("--time", default="04:00:00")
+    s.add_argument("--max-running", type=int, help="limit concurrently running tasks")
+    s.add_argument("--dry-run", action="store_true", help="print the batch script header and stop")
+    s.set_defaults(func=cmd_submit)
+
+    for nm, fn, hlp in [("status", cmd_status, "summarise a submission"),
+                        ("recover", cmd_recover, "retry copy-out of outputs stranded on node disks"),
+                        ("clean", cmd_clean, "remove node-local leftovers of a finished submission")]:
+        s = sub.add_parser(nm, help=hlp)
+        s.add_argument("ref", help="name/id (or name for its latest id)")
+        if nm == "clean":
+            s.add_argument("--force", action="store_true", help="also delete stranded outputs")
+        s.set_defaults(func=fn)
+
+    s = sub.add_parser("resubmit", help="rerun failed or lost tasks into the same output directory")
+    s.add_argument("ref")
+    s.add_argument("--tasks", help="explicit task list, e.g. 3,7,10-12")
+    s.add_argument("--include-stranded", action="store_true", help="also rerun tasks whose outputs are stranded")
+    s.add_argument("--time")
+    s.add_argument("--mem")
+    s.set_defaults(func=cmd_resubmit)
+
+    s = sub.add_parser("token", help="refresh the bearer token on every node")
+    s.add_argument("--watch", action="store_true", help="keep refreshing while mc1batch jobs remain")
+    s.add_argument("--interval", type=int, default=60, help="minutes between refreshes")
+    s.add_argument("--remove", action="store_true", help="delete the token from all nodes")
+    s.set_defaults(func=cmd_token)
+
+    sub.add_parser("list", help="list submissions").set_defaults(func=cmd_list)
+    sub.add_parser("check", help="check access, nodes, token and output area").set_defaults(func=cmd_check)
+
+    a = p.parse_args()
+    a.func(a)
+
+
+if __name__ == "__main__":
+    main()
