@@ -7,6 +7,8 @@
 #   mu2e    mu2e -c job.fcl [-S inputs] [-n N] <extra>; outputs are the new
 #           .root/.art files in the work directory
 #   script  bash user.sh <args>; outputs are the files it leaves in $MC1_OUTPUT_DIR
+# With MC1_CODE_SHA set (submit --tarball) the code tarball is fetched from
+# dCache and unpacked in $MC1_CODE before the setup runs.
 # With MC1_COPYOUT_ONLY=1 it only retries the copy-out of a stranded task
 # (used by "mc1batch recover").
 #
@@ -38,6 +40,31 @@ put() {
         sleep 30
     done
     return 1
+}
+
+# The code tarball, fetched once per node into /data-local and shared by every
+# task (of any submission) that uses the same tarball. The first task holds a
+# lock while it downloads, checks and unpacks it; the others wait and reuse it.
+fetch_code() {
+    export MC1_CODE=/data-local/$MC1_USER/mc1batch/code/${MC1_CODE_SHA:0:16}
+    mkdir -p "$(dirname "$MC1_CODE")" || return 1
+    (
+        flock -w 3600 9 || { echo "mc1batch: timed out waiting for $MC1_CODE.lock"; exit 1; }
+        [ -e "$MC1_CODE/.mc1_ok" ] && exit 0
+        local tmp=$MC1_CODE.tmp tball=$MC1_CODE.tmp/.mc1_code.tar try
+        rm -rf "$tmp" && mkdir -p "$tmp" || exit 1
+        echo "mc1batch: fetching code tarball $MC1_CODE_URL"
+        for try in 1 2 3; do
+            xrd xrdcp -s -f "$MC1_XRD_HOST/$MC1_CODE_URL" "$tball" && break
+            echo "mc1batch: xrdcp of the code tarball failed (try $try)"
+            [ $try = 3 ] && exit 1
+            sleep 30
+        done
+        echo "$MC1_CODE_SHA  $tball" | sha256sum -c --quiet || exit 1
+        tar -xf "$tball" -C "$tmp" && rm -f "$tball" || exit 1
+        rm -rf "$MC1_CODE" && mv "$tmp" "$MC1_CODE" && touch "$MC1_CODE/.mc1_ok"
+        echo "mc1batch: unpacked code in $MC1_CODE ($(du -sh "$MC1_CODE" | cut -f1))"
+    ) 9> "$MC1_CODE.lock"
 }
 
 # Copy outputs, then the log, then the status file (written last, so its
@@ -111,6 +138,11 @@ if [ "$MC1_MODE" = input ]; then
     echo "mc1batch: inputs:"; cat task_inputs.txt
 fi
 rm -f inputs.txt
+
+if [ -n "${MC1_CODE_SHA:-}" ]; then
+    fetch_code || { echo "mc1batch: could not get the code tarball"; finish 1; }
+    echo "mc1batch: code in $MC1_CODE"
+fi
 
 set +u
 if [ "$MC1_EXE" = mu2e ] || [ -n "$MC1_SETUP" ]; then

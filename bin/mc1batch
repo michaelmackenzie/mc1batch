@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import math
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -39,6 +41,8 @@ VAULT = "htvaultprod.fnal.gov"
 MAX_ARRAY = 1000           # MaxArraySize is 1001, so indices 0..1000
 MAX_SCRIPT = 3_500_000     # Slurm's default script limit is 4 MB
 SETUP_ART = "/cvmfs/mu2e.opensciencegrid.org/setupmu2e-art.sh"
+CODE_EXTS = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
+MUSE_SETUP = 'source "$MC1_CODE/Code/setup.sh"'   # what a "muse tarball" provides
 
 # Names the task script uses in its work directory.
 RESERVED = {"job.sh", "job.fcl", "user.sh", "inputs.txt", "task_inputs.txt", "task.log",
@@ -238,6 +242,42 @@ def check_staged(inputs: list[str], what: str, sample: int = 200) -> None:
         info(f"inputs on disk ({checked} checked)")
 
 
+# ------------------------------------------------------------ code tarball
+
+def tarball_has(path: Path, member: str) -> bool:
+    """Whether the tarball contains member (stops reading at the first match)."""
+    try:
+        with tarfile.open(path) as tar:
+            return any(ti.name.lstrip("./") == member for ti in tar)
+    except (tarfile.TarError, OSError) as e:
+        die(f"cannot read tarball {path}: {e}")
+
+
+def stage_tarball(path: Path, upload: bool) -> dict:
+    """Put a code tarball on dCache as <outbase>/.tarballs/<sha256 prefix><ext>,
+    once per content. The tasks fetch it from there (once per node)."""
+    ext = next((e for e in CODE_EXTS if path.name.endswith(e)), None)
+    if not ext:
+        die(f"--tarball must end in one of {' '.join(CODE_EXTS)}")
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+    sha, size = h.hexdigest(), path.stat().st_size
+    dest = OUTBASE / ".tarballs" / f"{sha[:16]}{ext}"
+    if upload and dest.exists() and dest.stat().st_size == size:
+        info(f"code tarball already on dCache: {dest}")
+    elif upload:
+        info(f"copying code tarball ({size / 1e6:.0f} MB) to {dest}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".new")
+        tmp.unlink(missing_ok=True)
+        shutil.copyfile(path, tmp)
+        dest.unlink(missing_ok=True)
+        tmp.rename(dest)
+    return {"source": str(path.resolve()), "pnfs": str(dest), "sha256": sha, "size": size}
+
+
 # ------------------------------------------------------------- submission
 
 def outdir(name: str, jid: str) -> Path:
@@ -303,6 +343,8 @@ def batch_script(m: dict, offset: int, idx: list[int], outid: str | None) -> str
         "MC1_TASK_OFFSET": str(offset), "MC1_MODE": m["mode"], "MC1_EXE": m["exe"], "MC1_FPJ": str(m["files_per_job"]),
         "MC1_NEVENTS": str(m["nevents"]), "MC1_SEED": str(m["seed"]), "MC1_SETUP": m["setup"],
         "MC1_EXTRA": m["extra"], "MC1_XRD_HOST": XRD_HOST, "MC1_XRD_PATH": xrd_path(OUTBASE),
+        "MC1_CODE_SHA": (m.get("code") or {}).get("sha256", ""),
+        "MC1_CODE_URL": xrd_path(Path(m["code"]["pnfs"])) if m.get("code") else "",
     }
     lines = [
         "#!/bin/bash",
@@ -369,6 +411,16 @@ def cmd_submit(a) -> None:
     exe, main = ("mu2e", Path(a.fcl)) if a.fcl else ("script", Path(a.script))
     if not main.is_file():
         die(f"no such file {main}")
+    if a.tarball:
+        tb = Path(a.tarball)
+        if not tb.is_file():
+            die(f"no such tarball {tb}")
+        if not a.setup:
+            if tarball_has(tb, "Code/setup.sh"):
+                a.setup = MUSE_SETUP
+            elif exe == "mu2e":
+                die(f"{tb} has no Code/setup.sh (not made by 'muse tarball'); give --setup, "
+                    "using $MC1_CODE for where it is unpacked")
     if exe == "mu2e" and not a.setup:
         die("--setup is required with -c/--fcl (e.g. 'muse setup SimJob MDC2025ay')")
     job_files = {"job.fcl" if exe == "mu2e" else "user.sh": main.read_bytes()}
@@ -398,19 +450,21 @@ def cmd_submit(a) -> None:
         if not a.skip_stage_check:
             check_staged(inputs, a.dataset if a.dataset and not a.max_files else "<file names>")
 
+    code = stage_tarball(Path(a.tarball), upload=not a.dry_run) if a.tarball else None
     m = {
         "name": a.name, "user": USER, "version": VERSION, "mode": mode,
         "submitted": datetime.now().astimezone().isoformat(timespec="seconds"),
         "command": " ".join(shlex.quote(x) for x in sys.argv),
         "exe": exe, "source": str(main.resolve()), "job_files": list(job_files),
-        "setup": a.setup, "extra": a.extra,
+        "setup": a.setup, "extra": a.extra, "code": code,
         "nevents": a.nevents, "seed": a.seed, "files_per_job": a.files_per_job,
         "dataset": a.dataset, "ntasks": ntasks, "ninputs": len(inputs),
         "resources": {"cpus": a.cpus, "mem": a.mem, "time": a.time, "max_running": a.max_running},
         "_job_files": job_files, "_inputs": inputs,
     }
     info(f"{a.name}: {ntasks} tasks running {exe} ({mode}"
-         + (f", {len(inputs)} files, {a.files_per_job}/task" if inputs else "") + ")")
+         + (f", {len(inputs)} files, {a.files_per_job}/task" if inputs else "") + ")"
+         + (f"\ncode tarball {code['sha256'][:16]}, setup: {a.setup}" if code else ""))
     if a.dry_run:
         print(batch_script(m, 0, list(range(min(ntasks, MAX_ARRAY + 1))), None)
               .split("base64 -d")[0] + "...payload...")
@@ -597,6 +651,30 @@ def cmd_list(a) -> None:
     info("\n".join(rows) if rows else f"no submissions under {OUTBASE}")
 
 
+def my_jobs() -> list[str]:
+    out = submit_host("squeue -h -o '%i %j'", check=False).stdout
+    return [l for l in out.splitlines() if f" mc1b-{USER}-" in l]
+
+
+def cmd_code(a) -> None:
+    base = f"/data-local/{USER}/mc1batch/code"
+    if a.remove is None:
+        res = on_nodes(nodes(), f"cd {base} 2>/dev/null && for d in */; do [ -e $d.mc1_ok ] && "
+                                f"echo ${{d%/}} $(du -sh $d | cut -f1); done; true")
+        rows = [f"{n}: {l}" for n, r in sorted(res.items()) for l in r.stdout.splitlines() if l.strip()]
+        info("\n".join(rows) if rows else "no code tarballs unpacked on the nodes")
+        info(f"uploaded tarballs: {OUTBASE / '.tarballs'}")
+        return
+    if my_jobs() and not a.force:
+        die("you have mc1batch jobs in Slurm that may be using the code; wait, or pass --force")
+    if any(not re.fullmatch(r"[0-9a-f]{4,64}", s) for s in a.remove):
+        die("give sha prefixes of at least 4 hex digits, as 'mc1batch code' lists them")
+    targets = " ".join(f"{base}/{s[:16]}*" for s in a.remove) if a.remove else base
+    on_nodes(nodes(), f"rm -rf {targets}")
+    info("removed " + (" ".join(s[:16] for s in a.remove) if a.remove else "all unpacked code")
+         + " from the nodes; the copies in .tarballs on dCache are untouched")
+
+
 def cmd_token(a) -> None:
     if a.remove:
         on_nodes(nodes(), f"rm -rf /scratch/{USER}/mc1batch/.token")
@@ -606,8 +684,7 @@ def cmd_token(a) -> None:
         push_token(nodes())
         if not a.watch:
             return
-        out = submit_host("squeue -h -o '%i %j'", check=False).stdout
-        mine = [l for l in out.splitlines() if f" mc1b-{USER}-" in l]
+        mine = my_jobs()
         if not mine:
             info("no mc1batch jobs left; stopping")
             return
@@ -646,6 +723,9 @@ def main() -> None:
     e.add_argument("--script", help="run this bash script instead of mu2e (see README for its environment)")
     s.add_argument("--setup", default="", help="setup command run after setupmu2e-art.sh, e.g. "
                    "'muse setup SimJob MDC2025ay' (required with --fcl, optional with --script)")
+    s.add_argument("--tarball", metavar="FILE",
+                   help="code tarball (e.g. from 'muse tarball') unpacked on each node; without "
+                        "--setup its Code/setup.sh is sourced")
     s.add_argument("--ship", action="append", default=[], metavar="FILE",
                    help="extra small file to put in the task's work directory (repeatable)")
     g = s.add_argument_group("inputs (one of)")
@@ -691,6 +771,11 @@ def main() -> None:
     s.add_argument("--interval", type=int, default=60, help="minutes between refreshes")
     s.add_argument("--remove", action="store_true", help="delete the token from all nodes")
     s.set_defaults(func=cmd_token)
+
+    s = sub.add_parser("code", help="list or remove code tarballs unpacked on the nodes")
+    s.add_argument("--remove", nargs="*", metavar="SHA", help="remove these (sha prefixes), or all")
+    s.add_argument("--force", action="store_true", help="remove even while you have jobs in Slurm")
+    s.set_defaults(func=cmd_code)
 
     sub.add_parser("list", help="list submissions").set_defaults(func=cmd_list)
     sub.add_parser("check", help="check access, nodes, token and output area").set_defaults(func=cmd_check)

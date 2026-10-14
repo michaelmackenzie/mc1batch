@@ -47,6 +47,9 @@ mc1batch submit myrun -c job.fcl --setup "..." --files files.txt
 # generator jobs, no inputs: baseSeed = --seed + task, firstSubRun = task
 mc1batch submit mygen -c gen.fcl --setup "..." --njobs 100 -n 10000 --seed 1000
 
+# your own code: a tarball from "muse tarball" (see "Your own code" below)
+mc1batch submit myrun -c job.fcl --tarball Code.tar.bz2 --dataset <dataset>
+
 # any bash script instead of mu2e (see "Script mode" below)
 mc1batch submit myana --script ana.sh --ship ana.py --args "--cut 5" \
     --setup "pyenv ana" --dataset <dataset> --files-per-job 5
@@ -57,11 +60,48 @@ mc1batch recover myrun/87      # copy back outputs stranded on node disks
 mc1batch clean myrun/87        # delete node-local leftovers when finished
 mc1batch list                  # all submissions and how many tasks are ok
 mc1batch token [--watch]       # refresh the token on all nodes
+mc1batch code [--remove [SHA]] # code tarballs unpacked on the nodes
 ```
 
 `<id>` is the Slurm job id of the first array. `--max-running N` caps how many
 tasks run at once; the cluster is shared, so use it for big submissions.
 `--dry-run` prints the batch script header without submitting.
+
+## Your own code (`--tarball`)
+
+To run code you built yourself, make a tarball of your Muse work area and
+pass it with `--tarball`:
+
+```bash
+cd <your muse work area>
+muse setup                 # as for building
+muse tarball               # prints the path of Code.tar.bz2
+mc1batch submit myrun -c job.fcl --tarball <path>/Code.tar.bz2 --dataset <dataset>
+```
+
+- `submit` copies the tarball to `<outbase>/.tarballs/<sha256>.<ext>` on
+  dCache, once per content (resubmitting, or reusing the same tarball,
+  copies nothing).
+- The first task on each node fetches it, checks its sha256 and unpacks it
+  in `/data-local/$USER/mc1batch/code/<sha256>/` (`$MC1_CODE`); tasks running
+  at the same time wait for it, and later tasks and submissions reuse it.
+- Without `--setup`, a tarball with `Code/setup.sh` (as `muse tarball` makes)
+  is set up with `source "$MC1_CODE/Code/setup.sh"`, so your build, its fcl
+  and the release it is backed by (on CVMFS) are set up as on the grid.
+- Any other tarball works too: give `--setup` (or, in script mode, use it
+  from the script) with `$MC1_CODE` as where it is unpacked, e.g.
+  `--setup 'source $MC1_CODE/mysetup.sh'`.
+- Build on an AL9 node (the workers run AL9), and keep build products out
+  of the tarball that you do not need: every node that runs a task holds an
+  unpacked copy.
+- Unpacked copies stay on the nodes until removed: `mc1batch code` lists
+  them, `mc1batch code --remove <sha prefix>` (or no argument for all) removes
+  them. The copies on dCache are yours to delete from `<outbase>/.tarballs/`.
+- Like the token, the unpacked code is readable by everyone who can log in
+  as `mu2ebatch`.
+
+Once the cluster has its shared NFS area, this step should become a single
+copy there.
 
 ## Script mode
 
@@ -73,6 +113,7 @@ The script starts in the task's work directory on the compute node, with:
 | `MC1_INPUTS` | file listing this task's input URLs (`root://...`), one per line; empty for `--njobs` |
 | `MC1_OUTPUT_DIR` | put the files to keep here; everything in it is copied to /pnfs |
 | `MC1_TASK` | task number (0, 1, ...) |
+| `MC1_CODE` | where the `--tarball` is unpacked (if given) |
 | `MC1_NEVENTS`, `MC1_SEED` | the `-n` and `--seed` values, if you want them |
 | `BEARER_TOKEN_FILE` | your token, so `xrdcp`, ROOT and uproot can read `root://` URLs |
 | `SLURM_CPUS_PER_TASK`, `OMP_NUM_THREADS` | the `--cpus` you asked for |
@@ -113,7 +154,7 @@ extension (`hist.root` → `hist.000012.root`).
 | rc | meaning | what to do |
 |----|---------|------------|
 | 0 | ok | |
-| 1 | `--setup` failed, or gave no `mu2e` | check the log, fix the setup string |
+| 1 | `--setup` failed, gave no `mu2e`, or the code tarball could not be fetched | check the log, fix the setup string |
 | 2 | `mu2e` or the script failed (its own exit code is in `status`) | check the log |
 | 3 | copy-out failed; outputs kept on the node (`stranded`) | `mc1batch recover` |
 | 4 | no token on the node | `mc1batch token`, then `resubmit` |
@@ -128,10 +169,10 @@ the Slurm state; rerun them with `resubmit --mem/--time`.
 
 - **No shared filesystem on the cluster.** Each task runs in
   `/scratch/$USER/mc1batch/<name>/<id>/<task>` on its node and deletes it at
-  the end. Only CVMFS is available, so the software must come from a CVMFS
+  the end. Only CVMFS is available, so the software comes from a CVMFS
   release (`muse setup SimJob <version>`, `muse setup EventNtuple ...`,
-  `pyenv ana`); a local muse build cannot be used yet. The fcl's `#include`s
-  must resolve in that release.
+  `pyenv ana`) or from your own `--tarball`. The fcl's `#include`s must
+  resolve in that setup.
 - **Inputs must be on disk.** xrootd cannot recall files that are only on
   tape (dCache `NEARLINE`). `submit` checks up to 200 inputs through the
   local `/pnfs` mount and refuses if any are tape-only; stage them first with
