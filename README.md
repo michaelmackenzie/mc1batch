@@ -65,6 +65,11 @@ mc1batch code [--remove [SHA]] # code tarballs unpacked on the nodes
 
 `<id>` is the Slurm job id of the first array. `--max-running N` caps how many
 tasks run at once; the cluster is shared, so use it for big submissions.
+`--nodes` runs the tasks only on the given nodes, as names or worker numbers
+(`--nodes 17-18`, `--nodes 17,18` or `--nodes mu2e-mc1-worker-17`), e.g. the
+faster Xeon nodes 17-18 instead of the Opteron nodes 02-16. The token is then
+installed only on those nodes. `resubmit` keeps the submission's `--nodes`
+unless given its own (`--nodes all` lifts it).
 `--dry-run` prints the batch script header without submitting.
 
 ## Your own code (`--tarball`)

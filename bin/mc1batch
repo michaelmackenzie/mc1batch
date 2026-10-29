@@ -127,6 +127,46 @@ def nodes() -> list[str]:
     return good
 
 
+def node_names(spec: str) -> list[str]:
+    """--nodes: comma-separated node names or worker numbers/ranges, e.g. '17-18' or 'mu2e-mc1-worker-17'."""
+    names = []
+    for part in spec.split(","):
+        part = part.strip()
+        if re.fullmatch(r"\d+(-\d+)?", part):
+            lo, _, hi = part.partition("-")
+            names += [f"mu2e-mc1-worker-{i:02d}" for i in range(int(lo), int(hi or lo) + 1)]
+        elif part:
+            names.append(part)
+    if not names:
+        die(f"--nodes '{spec}' names no nodes")
+    return names
+
+
+def prepare_nodes(m: dict) -> None:
+    """Install the token on the nodes the tasks may run on, and exclude every other node of the partition (with
+    --nodes) and the nodes where the install failed. Slurm's own --nodelist would make each task ask for all of
+    the listed nodes, so the restriction is an --exclude of the rest."""
+    usable = nodes()
+    want = m["resources"].get("nodes")
+    if not want:
+        m["_exclude"] = push_token(usable)
+        return
+    every = submit_host(f"sinfo -h -N -p {PARTITION} -o '%N'").stdout.split()
+    unknown = [n for n in want if n not in every]
+    if unknown:
+        die(f"--nodes: not in partition {PARTITION}: {' '.join(unknown)}")
+    use = [n for n in usable if n in want]
+    if not use:
+        die(f"--nodes: none of {' '.join(want)} is usable now (down or drained)")
+    if len(use) < len(want):
+        info(f"--nodes: not usable now, skipped: {' '.join(n for n in want if n not in use)}")
+    bad = push_token(use)
+    if len(bad) == len(use):
+        die("the token could not be installed on any of the --nodes")
+    m["_exclude"] = sorted(set(every) - set(use)) + bad
+    info(f"tasks restricted to {' '.join(n for n in use if n not in bad)}")
+
+
 def on_nodes(names: list[str], cmd: str, stdin: bytes | None = None) -> dict[str, subprocess.CompletedProcess]:
     """Run cmd on every node directly (not through Slurm, so it works when the cluster is full)."""
     def one(n):
@@ -459,7 +499,8 @@ def cmd_submit(a) -> None:
         "setup": a.setup, "extra": a.extra, "code": code,
         "nevents": a.nevents, "seed": a.seed, "files_per_job": a.files_per_job,
         "dataset": a.dataset, "ntasks": ntasks, "ninputs": len(inputs),
-        "resources": {"cpus": a.cpus, "mem": a.mem, "time": a.time, "max_running": a.max_running},
+        "resources": {"cpus": a.cpus, "mem": a.mem, "time": a.time, "max_running": a.max_running,
+                      "nodes": node_names(a.nodes) if a.nodes else None},
         "_job_files": job_files, "_inputs": inputs,
     }
     info(f"{a.name}: {ntasks} tasks running {exe} ({mode}"
@@ -470,7 +511,7 @@ def cmd_submit(a) -> None:
               .split("base64 -d")[0] + "...payload...")
         return
 
-    m["_exclude"] = push_token(nodes())
+    prepare_nodes(m)
     submit_tasks(m, list(range(ntasks)), None)
     d = outdir(a.name, m["id"])
     d.mkdir(parents=True, exist_ok=True)
@@ -601,7 +642,9 @@ def cmd_resubmit(a) -> None:
         m["resources"]["time"] = a.time
     if a.mem:
         m["resources"]["mem"] = a.mem
-    m["_exclude"] = push_token(nodes())
+    if a.nodes:
+        m["resources"]["nodes"] = None if a.nodes == "all" else node_names(a.nodes)
+    prepare_nodes(m)
     submit_tasks(m, tasks, jid)
     write_manifest({k: v for k, v in m.items() if not k.startswith("_")})
 
@@ -746,6 +789,8 @@ def main() -> None:
     s.add_argument("--mem", default="4G")
     s.add_argument("--time", default="04:00:00")
     s.add_argument("--max-running", type=int, help="limit concurrently running tasks")
+    s.add_argument("--nodes", help="run only on these nodes: comma-separated names or worker numbers/ranges, "
+                   "e.g. '17-18' (default: any usable node)")
     s.add_argument("--dry-run", action="store_true", help="print the batch script header and stop")
     s.set_defaults(func=cmd_submit)
 
@@ -764,6 +809,7 @@ def main() -> None:
     s.add_argument("--include-stranded", action="store_true", help="also rerun tasks whose outputs are stranded")
     s.add_argument("--time")
     s.add_argument("--mem")
+    s.add_argument("--nodes", help="run only on these nodes (as for submit; 'all' lifts the submission's --nodes)")
     s.set_defaults(func=cmd_resubmit)
 
     s = sub.add_parser("token", help="refresh the bearer token on every node")
